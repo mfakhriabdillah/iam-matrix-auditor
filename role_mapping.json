@@ -1,0 +1,7 @@
+{
+  "GCP Console Monitoring": ["roles/monitoring.viewer"],
+  "GCP Billing": ["roles/billing.user"],
+  "Create Bucket GCS": ["roles/storage.admin", "roles/storage.objectAdmin"],
+  "IAP Desktop": ["roles/iap.tunnelResourceAccessor", "roles/compute.osLogin"],
+  "default_vm_access": ["roles/compute.osAdminLogin", "roles/iap.tunnelResourceAccessor"]
+}
