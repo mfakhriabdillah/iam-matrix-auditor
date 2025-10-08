@@ -2,15 +2,16 @@ import pandas as pd
 import subprocess
 import json
 import sys
+import os # Import the 'os' library to handle directories
 from collections import defaultdict
-from tabulate import tabulate # Import the new library
+from tabulate import tabulate
 
 # --- Configuration ---
-# Name of the column containing user and service account emails
-PRINCIPAL_COLUMN_NAME = "Email" 
-# Name of the mapping file
+PRINCIPAL_COLUMN_NAME = "Email"
 ROLE_MAPPING_FILE = "role_mapping.json"
+OUTPUT_DIRECTORY = "iam_audit_reports" # Name of the folder to save reports
 
+# List of substrings to identify and ignore ALL service accounts
 GOOGLE_MANAGED_PATTERNS = [
     ".iam.gserviceaccount.com",
 ]
@@ -40,34 +41,51 @@ def load_and_parse_spreadsheet(filepath, role_mapping):
     print(f"📖 Reading IAM matrix from '{filepath}'...")
     try:
         df = pd.read_excel(filepath, header=[0, 1, 2])
-        df_reset = df.reset_index()
-        df_reset.columns = [' '.join(map(str, col)).strip() for col in df_reset.columns.values]
+        df_reset = df.reset_index(drop=True) # drop=True prevents adding the old index as a column
+        
+        # Convert all parts of the multi-level column headers to strings before joining
+        df_reset.columns = [' '.join(map(str, col)).strip() for col in df.columns.values]
+
     except FileNotFoundError:
         print(f"❌ Error: The file '{filepath}' was not found.")
         sys.exit(1)
     except Exception as e:
         print(f"❌ An error occurred while reading the Excel file: {e}")
         sys.exit(1)
+
+    # --- FIX IS HERE: More robust way to find the email column ---
+    # Find the first column whose name starts with our PRINCIPAL_COLUMN_NAME ("Email")
+    try:
+        email_column_name = next(col for col in df_reset.columns if col.startswith(PRINCIPAL_COLUMN_NAME))
+    except StopIteration:
+        print(f"❌ Critical Error: Could not find a column starting with '{PRINCIPAL_COLUMN_NAME}' in the spreadsheet.")
+        sys.exit(1)
     
-    info_cols = [col for col in df_reset.columns if col.startswith('Email') or col.startswith('index')]
-    project_cols = [col for col in df_reset.columns if col not in info_cols]
+    project_cols = [col for col in df_reset.columns if not col.startswith(PRINCIPAL_COLUMN_NAME)]
     project_ids = sorted(list(set([col[0] for col in df.columns if isinstance(col[0], str) and '-' in col[0]])))
     
     desired_state = defaultdict(lambda: defaultdict(set))
     
-    for _, row in df_reset.iterrows():
-        principal_email = row.get(info_cols[0])
-        if not principal_email or pd.isna(principal_email): continue
+    for index, row in df_reset.iterrows():
+        principal_email = row.get(email_column_name)
+        
+        # --- FIX IS HERE: Ensure the cell value is a string before processing ---
+        # If the cell is empty, not a string, or doesn't contain '@', skip it.
+        if not isinstance(principal_email, str) or '@' not in principal_email:
+            continue
 
         prefix = "serviceAccount:" if principal_email.endswith(".gserviceaccount.com") else "user:"
         full_principal_name = f"{prefix}{principal_email}"
 
         for proj_col_name in project_cols:
-            if row[proj_col_name] == True:
+            # Check for boolean True, but also handle string "TRUE"
+            if str(row.get(proj_col_name, '')).upper() == 'TRUE':
                 project_id_parts = [part for part in proj_col_name.split() if '-' in part]
                 if not project_id_parts: continue
+                
                 project_id = project_id_parts[0]
                 permission_name = proj_col_name.split()[-1]
+                
                 roles_to_add = role_mapping.get(permission_name, role_mapping.get("default_vm_access", []))
                 for role in roles_to_add:
                     desired_state[project_id][full_principal_name].add(role)
@@ -77,6 +95,7 @@ def load_and_parse_spreadsheet(filepath, role_mapping):
 
 def get_project_iam_state(project_id):
     """Fetches and parses the IAM policy for a single project."""
+    # This message will still print to the console for progress tracking
     print(f"\n- - - Auditing Project: {project_id} - - -")
     print("  Fetching current IAM policy from GCP...")
     command = f'gcloud projects get-iam-policy "{project_id}" --format="json"'
@@ -89,12 +108,7 @@ def get_project_iam_state(project_id):
     actual_state = defaultdict(set)
     for binding in json.loads(iam_policy_json).get("bindings", []):
         for member in binding.get("members", []):
-            is_filtered_out = False
-            # Check if the member matches any of the exclusion patterns
-            for pattern in GOOGLE_MANAGED_PATTERNS:
-                if pattern in member:
-                    is_filtered_out = True
-                    break
+            is_filtered_out = any(pattern in member for pattern in GOOGLE_MANAGED_PATTERNS)
             if not is_filtered_out:
                 actual_state[member].add(binding["role"])
     
@@ -102,63 +116,70 @@ def get_project_iam_state(project_id):
 
 def main():
     """Main function to orchestrate the multi-project IAM audit."""
-    filepath = input("Enter the path to your IAM matrix Excel file (e.g., user_list.xlsx'): ")
+    filepath = input("Enter the path to your IAM matrix Excel file (e.g., 'access_user_djbk.xlsx'): ")
     
     role_mapping = load_role_mapping()
     desired_state, project_ids = load_and_parse_spreadsheet(filepath, role_mapping)
     
+    # --- NEW: Create the output directory if it doesn't exist ---
+    if not os.path.exists(OUTPUT_DIRECTORY):
+        os.makedirs(OUTPUT_DIRECTORY)
+        print(f"📁 Created directory for reports: '{OUTPUT_DIRECTORY}'")
+
     print("\n" + "="*60)
     print("        🚀 Starting Advanced Multi-Project IAM Audit 🚀")
     print("="*60)
 
     for project_id in project_ids:
         actual_state = get_project_iam_state(project_id)
-        if actual_state is None: continue
-
-        desired_principals = set(desired_state.get(project_id, {}).keys())
-        actual_principals = set(actual_state.keys())
-
-        unauthorized = sorted(list(actual_principals - desired_principals))
-        missing = sorted(list(desired_principals - actual_principals))
-        common = sorted(list(actual_principals.intersection(desired_principals)))
         
-        # --- Data Collection for Tables ---
-        unauthorized_table = []
-        mismatch_table = []
-        
-        for p in unauthorized:
-            unauthorized_table.append([p, "\n".join(sorted(list(actual_state[p])))])
-        
-        for p in common:
-            desired_roles = desired_state[project_id][p]
-            actual_roles = actual_state[p]
-            extra = actual_roles - desired_roles
-            missing_roles = desired_roles - actual_roles
-            if extra:
-                mismatch_table.append([p, "🚨 Extra Roles", "\n".join(sorted(list(extra)))])
-            if missing_roles:
-                mismatch_table.append([p, "⚠️  Missing Roles", "\n".join(sorted(list(missing_roles)))])
+        # --- NEW: Build the report for this project as a string ---
+        report_lines = []
+        report_lines.append(f"IAM AUDIT REPORT FOR PROJECT: {project_id}")
+        report_lines.append("="*60)
 
-        # --- Report Generation ---
-        has_findings = unauthorized_table or mismatch_table or missing
-        
-        if not has_findings:
-            print("  ✅ No discrepancies found.")
-            continue
+        if actual_state is None:
+            report_lines.append("\n  ❌ Failed to fetch IAM policy from GCP. Cannot generate report.")
+        else:
+            desired_principals = set(desired_state.get(project_id, {}).keys())
+            actual_principals = set(actual_state.keys())
 
-        if unauthorized_table:
-            print("\n  🚨 UNAUTHORIZED PRINCIPALS (in GCP but not spreadsheet):")
-            print(tabulate(unauthorized_table, headers=["Principal", "Roles Found"], tablefmt="grid"))
-
-        if mismatch_table:
-            print("\n  🔎 ROLE MISMATCHES (for principals in both GCP and spreadsheet):")
-            print(tabulate(mismatch_table, headers=["Principal", "Finding", "Roles"], tablefmt="grid"))
+            unauthorized = sorted(list(actual_principals - desired_principals))
+            missing = sorted(list(desired_principals - actual_principals))
+            common = sorted(list(actual_principals.intersection(desired_principals)))
             
-        if missing:
-            print("\n  ⚠️  MISSING PRINCIPALS (in spreadsheet but not in GCP):")
-            # For simple lists, just print them out.
-            for p in missing:
-                print(f"     - {p}")
+            unauthorized_table = [[p, "\n".join(sorted(list(actual_state[p])))] for p in unauthorized]
+            mismatch_table = []
+            for p in common:
+                desired_roles = desired_state[project_id][p]
+                actual_roles = actual_state[p]
+                extra = actual_roles - desired_roles
+                missing_roles = desired_roles - actual_roles
+                if extra: mismatch_table.append([p, "🚨 Extra Roles", "\n".join(sorted(list(extra)))])
+                if missing_roles: mismatch_table.append([p, "⚠️  Missing Roles", "\n".join(sorted(list(missing_roles)))])
+
+            has_findings = unauthorized_table or mismatch_table or missing
+            
+            if not has_findings:
+                report_lines.append("\n  ✅ No discrepancies found.")
+            else:
+                if unauthorized_table:
+                    report_lines.append("\n\n  🚨 UNAUTHORIZED PRINCIPALS (in GCP but not spreadsheet):")
+                    report_lines.append(tabulate(unauthorized_table, headers=["Principal", "Roles Found"], tablefmt="grid"))
+                if mismatch_table:
+                    report_lines.append("\n\n  🔎 ROLE MISMATCHES (for principals in both GCP and spreadsheet):")
+                    report_lines.append(tabulate(mismatch_table, headers=["Principal", "Finding", "Roles"], tablefmt="grid"))
+                if missing:
+                    report_lines.append("\n\n  ⚠️  MISSING PRINCIPALS (in spreadsheet but not in GCP):")
+                    for p in missing: report_lines.append(f"     - {p}")
+        
+        # --- NEW: Write the collected report lines to a file ---
+        report_content = "\n".join(report_lines)
+        output_filename = os.path.join(OUTPUT_DIRECTORY, f"{project_id}_iam_audit.txt")
+        with open(output_filename, "w") as f:
+            f.write(report_content)
+        
+        print(f"  📄 Report saved to: '{output_filename}'")
 
     print("\n" + "="*60 + "\n          ✨ Audit Complete ✨\n" + "="*60)
 
