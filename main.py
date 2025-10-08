@@ -12,9 +12,7 @@ ROLE_MAPPING_FILE = "role_mapping.json"
 
 # List of substrings to identify and ignore Google-managed service agents
 GOOGLE_MANAGED_PATTERNS = [
-    "@gcp-sa-", "-robot.iam.gserviceaccount.com", "@appspot.gserviceaccount.com",
-    "@developer.gserviceaccount.com", "@gs-project-accounts.iam.gserviceaccount.com",
-    "@service-networking.iam.gserviceaccount.com",
+    ".iam.gserviceaccount.com",
 ]
 
 def run_gcloud_command(command):
@@ -108,7 +106,7 @@ def get_project_iam_state(project_id):
 
 def main():
     """Main function to orchestrate the multi-project IAM audit."""
-    filepath = input("Enter the path to your IAM matrix Excel file (e.g., 'access_user_djbk.xlsx'): ")
+    filepath = input("Enter the path to your IAM matrix Excel file (e.g., 'user_list_access.xlsx'): ")
     
     role_mapping = load_role_mapping()
     desired_state, project_ids = load_and_parse_spreadsheet(filepath, role_mapping)
