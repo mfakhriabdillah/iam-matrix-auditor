@@ -10,6 +10,7 @@ from tabulate import tabulate
 PRINCIPAL_COLUMN_NAME = "Email"
 ROLE_MAPPING_FILE = "role_mapping.json"
 OUTPUT_DIRECTORY = "iam_audit_reports"
+EXCEL_REPORT_FILENAME = "gcp_iam_audit_report.xlsx" # The name of the final Excel report
 
 # List of substrings to identify and ignore ALL service accounts
 GOOGLE_MANAGED_PATTERNS = [
@@ -27,7 +28,7 @@ def run_gcloud_command(command):
 def load_role_mapping():
     """Loads the permission-to-role mapping from the JSON file."""
     try:
-        with open(ROLE_MAPPING_FILE, 'r', encoding="utf-8") as f: # Added encoding for safety
+        with open(ROLE_MAPPING_FILE, 'r', encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         print(f"❌ Critical Error: The mapping file '{ROLE_MAPPING_FILE}' was not found.")
@@ -103,7 +104,7 @@ def get_project_iam_state(project_id):
 
 def main():
     """Main function to orchestrate the multi-project IAM audit."""
-    filepath = input("Enter the path to your IAM matrix Excel file (e.g., 'access_user_djbk.xlsx'): ")
+    filepath = input("Enter the path to your IAM matrix Excel file (e.g., 'access_user.xlsx'): ")
     
     role_mapping = load_role_mapping()
     desired_state, project_ids = load_and_parse_spreadsheet(filepath, role_mapping)
@@ -116,12 +117,13 @@ def main():
     print("        🚀 Starting Advanced Multi-Project IAM Audit 🚀")
     print("="*60)
 
+    # --- NEW: List to hold all findings for the final Excel report ---
+    all_findings_for_excel = []
+
     for project_id in project_ids:
         actual_state = get_project_iam_state(project_id)
         
-        report_lines = []
-        report_lines.append(f"IAM AUDIT REPORT FOR PROJECT: {project_id}")
-        report_lines.append("="*60)
+        report_lines = [f"IAM AUDIT REPORT FOR PROJECT: {project_id}", "="*60]
 
         if actual_state is None:
             report_lines.append("\n  ❌ Failed to fetch IAM policy from GCP. Cannot generate report.")
@@ -133,38 +135,72 @@ def main():
             missing = sorted(list(desired_principals - actual_principals))
             common = sorted(list(actual_principals.intersection(desired_principals)))
             
-            unauthorized_table = [[p, "\n".join(sorted(list(actual_state[p])))] for p in unauthorized]
+            # --- Data Collection for Tables and Excel ---
+            unauthorized_table = []
             mismatch_table = []
-            for p in common:
-                desired_roles = desired_state[project_id][p]
-                actual_roles = actual_state[p]
-                extra = actual_roles - desired_roles
-                missing_roles = desired_roles - actual_roles
-                if extra: mismatch_table.append([p, "🚨 Extra Roles", "\n".join(sorted(list(extra)))])
-                if missing_roles: mismatch_table.append([p, "⚠️  Missing Roles", "\n".join(sorted(list(missing_roles)))])
 
-            if not (unauthorized_table or mismatch_table or missing):
+            for p in unauthorized:
+                roles = "\n".join(sorted(list(actual_state[p])))
+                unauthorized_table.append([p, roles])
+                all_findings_for_excel.append({"Project ID": project_id, "Principal": p, "Finding Type": "UNAUTHORIZED", "Details / Roles": roles.replace("\n", ", ")})
+
+            for p in missing:
+                all_findings_for_excel.append({"Project ID": project_id, "Principal": p, "Finding Type": "MISSING_PRINCIPAL", "Details / Roles": ""})
+
+            for p in common:
+                desired_roles, actual_roles = desired_state[project_id][p], actual_state[p]
+                extra, missing_roles = actual_roles - desired_roles, desired_roles - actual_roles
+                
+                if extra:
+                    roles = "\n".join(sorted(list(extra)))
+                    mismatch_table.append([p, "🚨 Extra Roles", roles])
+                    all_findings_for_excel.append({"Project ID": project_id, "Principal": p, "Finding Type": "EXTRA_ROLES", "Details / Roles": roles.replace("\n", ", ")})
+                if missing_roles:
+                    roles = "\n".join(sorted(list(missing_roles)))
+                    mismatch_table.append([p, "⚠️  Missing Roles", roles])
+                    all_findings_for_excel.append({"Project ID": project_id, "Principal": p, "Finding Type": "MISSING_ROLES", "Details / Roles": roles.replace("\n", ", ")})
+
+            # --- Report Generation for Text File ---
+            has_findings = unauthorized_table or mismatch_table or missing
+            if not has_findings:
                 report_lines.append("\n  ✅ No discrepancies found.")
             else:
                 if unauthorized_table:
-                    report_lines.append("\n\n  🚨 UNAUTHORIZED PRINCIPALS (in GCP but not spreadsheet):")
+                    report_lines.append("\n\n  🚨 UNAUTHORIZED PRINCIPALS:")
                     report_lines.append(tabulate(unauthorized_table, headers=["Principal", "Roles Found"], tablefmt="grid"))
                 if mismatch_table:
-                    report_lines.append("\n\n  🔎 ROLE MISMATCHES (for principals in both GCP and spreadsheet):")
+                    report_lines.append("\n\n  🔎 ROLE MISMATCHES:")
                     report_lines.append(tabulate(mismatch_table, headers=["Principal", "Finding", "Roles"], tablefmt="grid"))
                 if missing:
-                    report_lines.append("\n\n  ⚠️  MISSING PRINCIPALS (in spreadsheet but not in GCP):")
+                    report_lines.append("\n\n  ⚠️  MISSING PRINCIPALS:")
                     for p in missing: report_lines.append(f"     - {p}")
         
+        # Write the individual text file report
         report_content = "\n".join(report_lines)
         output_filename = os.path.join(OUTPUT_DIRECTORY, f"{project_id}_iam_audit.txt")
-        
-        # --- THE FIX IS HERE ---
-        # Explicitly open the file with UTF-8 encoding to support all characters.
         with open(output_filename, "w", encoding="utf-8") as f:
             f.write(report_content)
+        print(f"  📄 Text report saved to: '{output_filename}'")
+
+    # --- NEW: Write the consolidated Excel report ---
+    if all_findings_for_excel:
+        print("\n" + "-"*60)
+        print("📊 Creating consolidated Excel report...")
+        df_report = pd.DataFrame(all_findings_for_excel)
+        excel_path = os.path.join(OUTPUT_DIRECTORY, EXCEL_REPORT_FILENAME)
         
-        print(f"  📄 Report saved to: '{output_filename}'")
+        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+            for project_id in project_ids:
+                # Filter DataFrame for the current project
+                df_project = df_report[df_report["Project ID"] == project_id].drop(columns=["Project ID"])
+                if not df_project.empty:
+                    # Write to a sheet named after the project ID
+                    df_project.to_excel(writer, sheet_name=project_id, index=False)
+        
+        print(f"  ✅ Excel report saved to: '{excel_path}'")
+    else:
+        print("\n" + "-"*60)
+        print("✅ No discrepancies found across any projects. No Excel report generated.")
 
     print("\n" + "="*60 + "\n          ✨ Audit Complete ✨\n" + "="*60)
 
